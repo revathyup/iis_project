@@ -1,0 +1,34 @@
+# Python cache and environments
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.env
+.env.*
+
+# Build and distribution artifacts
+build/
+dist/
+*.egg-info/
+
+# IDE/editor files
+.vscode/
+.idea/
+
+# Logs and runs
+*.log
+logs/
+outputs/
+
+# Data and media (store large assets elsewhere)
+data/
+*.mp4
+*.mov
+
+# OS
+.DS_Store
+Thumbs.db
