@@ -28,3 +28,5 @@ medium: wait 3s (--medium-delay-seconds) then advance
 low: repeat the same question + give the answer again
 It uses --wait-speak-end so Furhat doesn’t interrupt itself.
 That’s the full logic chain we implemented.
+
+command used to run from inside venv of root folder - python -u integration\openai_swedish_tutor.py --uri ws://localhost:9000/v1/events --labels angry disgust fear happy neutral sad surprise --openface-weights weights/MTL_backbone.pth --openface-classifier models/openface_emotion_clf.pkl --display --wait-speak-end --use-asr --listen-timeout 8 --use-openai --debug --asr-dump
