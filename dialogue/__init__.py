@@ -1,2 +1,0 @@
-"""Dialogue subsystem package."""
-

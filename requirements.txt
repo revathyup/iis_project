@@ -1,0 +1,27 @@
+# openface-test==0.1.26 should be installed separately (it has strict/old deps):
+#   pip install --no-deps openface-test==0.1.26
+#
+# PyTorch on Windows should be installed from the official index URL (CPU or CUDA):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# (We don't pin torch/torchvision here for Windows because the wheels are not on PyPI.)
+torch==2.9.0; sys_platform != 'win32'
+torchvision==0.24.0; sys_platform != 'win32'
+numpy==1.26.4
+protobuf==4.25.3
+mediapipe==0.10.21
+matplotlib==3.10.7
+tqdm==4.67.1
+scikit-learn==1.7.2  # needed for traditional ML algorithms
+joblib==1.4.2
+opencv-python==4.11.0.86  # needed for image processing and some out-of-the-box models
+pillow==11.3.0
+ipykernel==7.0.1  # needed for Jupyter notebooks
+websockets>=12,<14  # Furhat Realtime API client
+# needed by openface
+click==8.3.0
+pandas==2.3.3
+scikit-image==0.25.2
+scipy==1.13.0
+tensorboardX==2.6.4
+timm==1.0.21
+huggingface_hub>=0.21.0,<1.0.0

@@ -53,5 +53,11 @@ class MediaPipeFaceDetector:
                 y1 = int(rel.ymin * h)
                 x2 = int((rel.xmin + rel.width) * w)
                 y2 = int((rel.ymin + rel.height) * h)
-                boxes.append((x1, y1, x2, y2))
+                # Clamp to image bounds (MediaPipe boxes can be slightly outside the frame).
+                x1 = max(0, min(x1, w - 1))
+                y1 = max(0, min(y1, h - 1))
+                x2 = max(0, min(x2, w))
+                y2 = max(0, min(y2, h))
+                if x2 > x1 and y2 > y1:
+                    boxes.append((x1, y1, x2, y2))
         return boxes
