@@ -36,16 +36,6 @@ from perception.detector import HaarFaceDetector, MediaPipeFaceDetector
 from perception.engagement import EngagementBucketMapper, softmax
 from perception.openface_classifier import OpenFaceEmotionClassifier
 
-# Keep ASCII-only (Windows terminal / Furhat TTS).
-LESSON = [
-    {"sv": "Vad heter du?", "en": "What is your name?", "answer": "Jag heter ____."},
-    {"sv": "Hur mar du?", "en": "How are you?", "answer": "Jag mar bra. / Jag mar inte sa bra."},
-    {"sv": "Var bor du?", "en": "Where do you live?", "answer": "Jag bor i ____."},
-    {"sv": "Var kommer du ifran?", "en": "Where do you come from?", "answer": "Jag kommer fran ____."},
-    {"sv": "Vad ar klockan?", "en": "What time is it?", "answer": "Klockan ar ____."},
-]
-
-
 def _now() -> float:
     return time.time()
 
@@ -103,6 +93,20 @@ class PerceptionEvent:
     confidence: float
 
 
+@dataclass
+class AffectiveFeedback:
+    key: str
+    sv: str
+    en: str
+    gesture: Optional[str] = None
+
+
+@dataclass
+class AffectiveState:
+    last_key: str = ""
+    last_ts: float = 0.0
+
+
 class PerceptionWorker:
     def __init__(
         self,
@@ -123,6 +127,7 @@ class PerceptionWorker:
         activity_threshold: Optional[float],
         activity_alpha: float,
         fps_limit: float,
+        log_emotions: bool,
         debug: bool,
     ) -> None:
         self._stop = threading.Event()
@@ -136,6 +141,7 @@ class PerceptionWorker:
         self._crop_margin = crop_margin
         self._camera_index = camera_index
         self._fps_limit = fps_limit
+        self._log_emotions = log_emotions
 
         self._clf = OpenFaceEmotionClassifier(
             weights_path=openface_weights,
@@ -223,7 +229,7 @@ class PerceptionWorker:
                 with self._lock:
                     self._events.append(evt)
 
-                if self._debug:
+                if self._debug and self._log_emotions:
                     probs = softmax(logits, labels=self._labels)
                     top3 = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)[:3]
                     sys.stderr.write(f"Top3: {top3}\n")
@@ -326,7 +332,8 @@ class FurhatClient:
         except asyncio.QueueEmpty:
             pass
         if debug and drained:
-            _log(True, f"[furhat][asr] drained {drained} queued messages")
+            if dump_messages:
+                _log(True, f"[furhat][asr] drained {drained} queued messages")
 
         # Start listening.
         await self._ws.send(json.dumps({"type": request_type}))
@@ -449,13 +456,55 @@ def openai_generate(
             sys.stderr.write(f"[openai] error: {e}\n")
         return None
 
+    def _extract_text(resp: dict) -> Optional[str]:
+        text_out = resp.get("output_text")
+        if isinstance(text_out, str) and text_out.strip():
+            return text_out.strip()
+        output = resp.get("output")
+        if isinstance(output, list):
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                content = item.get("content")
+                if isinstance(content, list):
+                    for part in content:
+                        if not isinstance(part, dict):
+                            continue
+                        if part.get("type") == "output_text" and isinstance(part.get("text"), str):
+                            return part.get("text").strip()
+                        if part.get("type") == "text" and isinstance(part.get("text"), str):
+                            return part.get("text").strip()
+        return None
+
+    def _try_parse_json(text: str) -> Optional[Dict[str, str]]:
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(text[start : end + 1])
+            except Exception:
+                return None
+        return None
+
     try:
         obj = json.loads(raw)
-        text_out = obj.get("output_text")
-        if isinstance(text_out, str) and text_out.strip():
-            return json.loads(text_out)
     except Exception:
+        if debug:
+            sys.stderr.write("[openai] failed to parse response JSON\n")
         return None
+
+    text = _extract_text(obj)
+    if text:
+        parsed = _try_parse_json(text)
+        if parsed is not None:
+            return parsed
+    if debug:
+        preview = raw[:500].replace("\n", " ")
+        sys.stderr.write(f"[openai] could not parse JSON output. raw preview: {preview}\n")
     return None
 
 
@@ -470,41 +519,302 @@ def build_bucket_summary(events: list[PerceptionEvent], *, min_majority: float) 
     return bucket, top_emotion
 
 
-def default_feedback(bucket: str, item: dict, user_answer: str) -> str:
-    answer_clean = str(item["answer"]).rstrip().rstrip(".")
+def average_confidence(events: list[PerceptionEvent]) -> float:
+    if not events:
+        return 0.0
+    return sum(e.confidence for e in events) / max(1, len(events))
+
+
+def select_affective_feedback(
+    *,
+    top_emotion: Optional[str],
+    confidence: float,
+    min_confidence: float,
+) -> Optional[AffectiveFeedback]:
+    if not top_emotion or confidence < min_confidence:
+        return None
+    emo = top_emotion.strip().lower()
+    if emo in ("happy", "surprise"):
+        return AffectiveFeedback(
+            key=emo,
+            sv="Du ser glad ut. Bra jobbat!",
+            en="You look happy. Nice work!",
+            gesture="BigSmile",
+        )
+    if emo in ("sad", "fear", "angry", "disgust"):
+        return AffectiveFeedback(
+            key=emo,
+            sv="Du verkar lite osaker. Det ar okej, vi tar det lugnt.",
+            en="You seem a bit unsure. That's ok, we'll take it slow.",
+            gesture="Thoughtful",
+        )
+    if emo == "neutral":
+        return AffectiveFeedback(
+            key=emo,
+            sv="Okej. Vi fortsatter lugnt.",
+            en="Ok. We'll continue calmly.",
+            gesture="Nod",
+        )
+    return None
+
+
+def should_emit_affective_feedback(
+    *,
+    state: AffectiveState,
+    feedback: AffectiveFeedback,
+    now_ts: float,
+    cooldown_s: float,
+) -> bool:
+    if feedback.key == state.last_key and (now_ts - state.last_ts) < cooldown_s:
+        return False
+    return (now_ts - state.last_ts) >= cooldown_s or feedback.key != state.last_key
+
+
+def _norm(text: str) -> str:
+    text = (text or "").lower()
+    keep = []
+    for ch in text:
+        if ch.isalnum() or ch.isspace():
+            keep.append(ch)
+        else:
+            keep.append(" ")
+    return " ".join("".join(keep).split())
+
+
+def _tokens_from_expected(expected: str) -> list[str]:
+    expected = expected.replace("____", " ")
+    return [t for t in _norm(expected).split() if t]
+
+
+def is_correct_answer(user_answer: str, expect: list[str] | None, expected_template: str) -> bool:
+    if expect:
+        expected_tokens = expect
+    else:
+        expected_tokens = _tokens_from_expected(expected_template)
+    if not expected_tokens:
+        return False
+    norm_answer = _norm(user_answer)
+    return all(tok in norm_answer for tok in expected_tokens)
+
+
+def is_repeat_intent(text: str) -> bool:
+    norm = _norm(text)
+    return any(k in norm for k in ("repeat", "again", "one more", "repetera", "igen", "repeat that", "say again"))
+
+
+def is_continue_intent(text: str) -> bool:
+    norm = _norm(text)
+    return any(
+        k in norm
+        for k in (
+            "continue",
+            "cotniue",
+            "continuing",
+            "next",
+            "go on",
+            "move on",
+            "fortsatt",
+            "fortsatta",
+            "nasta",
+            "yes",
+            "ok",
+        )
+    )
+
+
+def is_not_understood_intent(text: str) -> bool:
+    norm = _norm(text)
+    return any(
+        k in norm
+        for k in ("no", "not", "didnt understand", "dont understand", "not sure", "i dont get", "forstar inte")
+    )
+
+
+def is_yes_intent(text: str) -> bool:
+    norm = _norm(text)
+    return any(k in norm for k in ("yes", "yeah", "yep", "sure", "correct", "right", "ja"))
+
+
+def is_no_intent(text: str) -> bool:
+    norm = _norm(text)
+    return any(k in norm for k in ("no", "nope", "nah", "not", "incorrect", "wrong", "nej"))
+
+
+def is_stop_intent(text: str) -> bool:
+    norm = _norm(text)
+    return any(k in norm for k in ("stop", "finish", "done", "enough", "sluta", "stopp", "avsluta"))
+
+
+def is_review_intent(text: str) -> bool:
+    norm = _norm(text)
+    return any(
+        k in norm
+        for k in (
+            "review",
+            "review them",
+            "to review",
+            "revise",
+            "repeat",
+            "again",
+            "go over",
+            "recap",
+            "repetera",
+            "view them",
+            "to view",
+        )
+    )
+
+
+def parse_line_count(text: str, default: int) -> int:
+    norm = _norm(text)
+    for token in norm.split():
+        if token.isdigit():
+            val = int(token)
+            if 1 <= val <= 10:
+                return val
+        if token == "f":
+            return 4
+    words = {
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "for": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10,
+    }
+    for word, val in words.items():
+        if word in norm:
+            return val
+    return default
+
+
+def is_advance_intent(text: str) -> bool:
+    norm = _norm(text)
+    return any(k in norm for k in ("move on", "next", "forward", "advance", "ga vidare", "nasta"))
+
+
+def is_doubt_text(text: str) -> bool:
+    norm = _norm(text)
+    return any(
+        k in norm
+        for k in (
+            "how do i",
+            "how to",
+            "what does",
+            "what is",
+            "can you",
+            "please explain",
+            "translate",
+            "meaning of",
+            "help me",
+        )
+    )
+
+
+def extract_topic(text: str) -> str:
+    norm = _norm(text)
+    # Drop common greetings/fillers at the start.
+    for filler in ("hey", "hi", "hello", "uh", "um", "er", "like"):
+        if norm.startswith(filler + " "):
+            norm = norm[len(filler) + 1 :].strip()
+            break
+    for prefix in (
+        "jag vill prata om",
+        "i want to talk about",
+        "i want to learn about",
+        "i want to learn",
+        "learn about",
+        "lets talk about",
+        "talk about",
+    ):
+        if norm.startswith(prefix):
+            norm = norm.replace(prefix, "").strip()
+            break
+    # Common ASR confusion: whether -> weather.
+    norm = norm.replace("whether", "weather")
+    return norm.strip() or "something"
+
+
+def is_topic_change(text: str) -> bool:
+    norm = _norm(text)
+    return any(k in norm for k in ("change topic", "new topic", "another topic", "switch topic"))
+
+
+def make_topic_system_prompt() -> str:
+    return (
+        "You are a Swedish tutor. Return a JSON object with keys: "
+        "line_sv, line_en, breakdown, pronunciation, notes, clarification_en, done. "
+        "line_sv: Swedish translation of user_line (one sentence). "
+        "line_en: English translation of line_sv (should match user_line meaning). "
+        "breakdown: list of objects with keys sv and en (word-by-word or short phrase-by-phrase meaning). "
+        "pronunciation: short English-friendly pronunciation guide for the Swedish line. "
+        "notes: short usage note (optional). "
+        "clarification_en: if user_question is present or doubt=true, answer in English briefly, else empty. "
+        "done: always false for translation mode. "
+        "Keep lines short, practical, and beginner-friendly unless level is advanced. "
+        "Never ask the learner to repeat after you. "
+        "If affect_bucket is low, keep it simpler and slow; if high, you can be a bit faster."
+    )
+
+
+def make_topic_user_prompt(
+    *,
+    topic: str,
+    level: str,
+    bucket: str,
+    user_line: str,
+    user_question: str,
+    doubt: bool,
+) -> str:
+    return (
+        f"topic={topic}\n"
+        f"level={level}\n"
+        f"affect_bucket={bucket}\n"
+        f"user_line={user_line}\n"
+        f"user_question={user_question}\n"
+        f"doubt={doubt}\n"
+        "Return JSON only."
+    )
+
+
+def make_topic_intro_system_prompt() -> str:
+    return (
+        "You are a Swedish tutor. Return a JSON object with keys: sv, en, pronunciation, notes. "
+        "sv: Swedish translation of the topic (short phrase). "
+        "en: English gloss for the Swedish phrase. "
+        "pronunciation: short English-friendly pronunciation guide. "
+        "notes: short usage note (optional). "
+        "Keep it brief."
+    )
+
+
+def make_topic_intro_user_prompt(*, topic: str) -> str:
+    return f"topic={topic}\nReturn JSON only."
+
+
+def decide_strategy(
+    *,
+    correct: bool,
+    bucket: str,
+    latency_s: float,
+    slow_seconds: float,
+    confidence: float,
+    min_confidence: float,
+) -> str:
+    if not correct:
+        return "repeat"
     if bucket == "low":
-        return f"Ok. Lets try again. Say: {answer_clean}."
-    if bucket == "high":
-        return "Great!"
-    return "Good."
-
-
-def make_system_prompt() -> str:
-    return (
-        "You are a Swedish language tutor embodied by a Furhat social robot. "
-        "Your output MUST be a JSON object with keys: say (string). "
-        "Be brief (1-2 sentences). "
-        "If the user answer is wrong or English, give the correct Swedish and ask them to repeat. "
-        "If bucket is low, be extra supportive and give a short hint. "
-        "Do not use emojis."
-    )
-
-
-def make_user_prompt(*, bucket: str, top_emotion: Optional[str], question_sv: str, question_en: str, expected: str, user_answer: str) -> str:
-    return (
-        f"bucket={bucket}\n"
-        f"top_emotion={top_emotion or ''}\n"
-        f"question_sv={question_sv}\n"
-        f"question_en={question_en}\n"
-        f"expected_answer_template={expected}\n"
-        f"user_answer={user_answer}\n"
-        "Return JSON: {\"say\":\"...\"}"
-    )
-
-
-def build_question_text(item: dict) -> str:
-    answer_clean = str(item["answer"]).rstrip().rstrip(".")
-    return f"Question: {item['sv']} (English: {item['en']}). Answer like this: {answer_clean}."
+        return "repeat"
+    if confidence < min_confidence:
+        return "repeat"
+    if latency_s > slow_seconds:
+        return "repeat"
+    return "advance"
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -531,6 +841,7 @@ async def run(args: argparse.Namespace) -> int:
         activity_threshold=args.activity_threshold,
         activity_alpha=args.activity_alpha,
         fps_limit=args.fps_limit,
+        log_emotions=args.log_emotions,
         debug=args.debug,
     )
     perception.start()
@@ -538,101 +849,503 @@ async def run(args: argparse.Namespace) -> int:
         raise RuntimeError("Perception did not start (webcam).")
 
     async with FurhatClient(uri=args.uri, key=args.key, debug=args.debug) as furhat:
-        greeting = "Hi! I am your Swedish tutor. Lets practice a few simple questions."
-        await furhat.speak(greeting, gesture="Nod", wait_end=True)
+        async def speak_sv_en(sv: str, en: str, *, gesture: Optional[str] = None) -> None:
+            if sv:
+                print(f"[tutor][sv] {sv}")
+                await furhat.speak(sv, gesture=gesture, wait_end=args.wait_speak_end)
+            if en:
+                print(f"[tutor][en] {en}")
+                await furhat.speak(en, gesture="Nod", wait_end=args.wait_speak_end)
 
-        lesson_index = 0
-        system_prompt = make_system_prompt()
+        async def listen_once(prompt: str) -> Tuple[str, float]:
+            if not args.use_asr:
+                try:
+                    text = await asyncio.to_thread(input, prompt)
+                except (EOFError, KeyboardInterrupt):
+                    return "", 0.0
+                text = (text or "").strip()
+                if text:
+                    print(f"[user][text] {text}")
+                return text, 0.0
+
+            start_t = _now()
+            text = (
+                await furhat.listen_text(
+                    timeout_s=args.listen_timeout,
+                    request_type=args.asr_request_type,
+                    stop_type=args.asr_stop_type,
+                    accept_any_type=not args.asr_strict_types,
+                    dump_messages=args.asr_dump,
+                    debug=args.debug,
+                )
+            ) or ""
+            end_t = _now()
+            text = text.strip()
+            if text:
+                print(f"[user][asr] {text}")
+            return text, max(0.0, end_t - start_t)
+
+        await speak_sv_en(
+            "Hej! Jag ar din svenska larare.",
+            "Hi! I am your Swedish tutor.",
+            gesture="Nod",
+        )
+
+        topic = ""
+        level_index = 0
+        affect_state = AffectiveState()
+        levels = ["A1", "A2", "B1", "B2", "C1"]
+        line_index = 0
+        last_step: Optional[dict] = None
+        last_user_line = ""
+        batch_entries: list[dict] = []
+        repeats = 0
+        understood_lines = 0
+        topic_start_ts = _now()
+        bucket_history: list[str] = []
+        latency_history: list[float] = []
+        topic_prompt = make_topic_system_prompt()
+
+        await speak_sv_en(
+            "Vad vill du lara dig idag?",
+            "What do you want to learn today? You can answer in English.",
+            gesture="Nod",
+        )
+        topic_answer, _ = await listen_once("You: ")
+        topic = extract_topic(topic_answer)
+        if not topic:
+            topic = "everyday Swedish"
+        needs_confirm = "whether" in _norm(topic_answer) or topic == "something"
+        if needs_confirm:
+            await speak_sv_en(
+                f"Menar du amnet {topic}?",
+                f"Did you mean the topic {topic}?",
+                gesture="Nod",
+            )
+            confirm, _ = await listen_once("You: ")
+            if is_no_intent(confirm):
+                await speak_sv_en(
+                    "Okej, sag amnet igen.",
+                    "Ok, please say the topic again.",
+                    gesture="Nod",
+                )
+                topic_answer, _ = await listen_once("You: ")
+                topic = extract_topic(topic_answer)
+            elif not is_yes_intent(confirm):
+                await speak_sv_en(
+                    "Jag fortsatter med det amnet jag horde.",
+                    "I will continue with the topic I heard.",
+                    gesture="Nod",
+                )
+            else:
+                refined = extract_topic(confirm)
+                if refined and refined != "something":
+                    topic = refined
+        if topic == "something":
+            await speak_sv_en(
+                "Jag horde inte amnet. Skriv amnet igen.",
+                "I did not catch the topic. Please say it again.",
+                gesture="Nod",
+            )
+            topic_answer, _ = await listen_once("You: ")
+            topic = extract_topic(topic_answer) or "everyday Swedish"
+        if args.use_openai and api_key:
+            intro = openai_generate(
+                api_key=api_key,
+                model=args.openai_model,
+                system_prompt=make_topic_intro_system_prompt(),
+                user_prompt=make_topic_intro_user_prompt(topic=topic),
+                timeout_s=args.openai_timeout,
+                debug=args.debug,
+            )
+            if isinstance(intro, dict):
+                intro_sv = (intro.get("sv") or "").strip()
+                intro_en = (intro.get("en") or "").strip()
+                intro_pron = (intro.get("pronunciation") or "").strip()
+                intro_notes = (intro.get("notes") or "").strip()
+                if intro_sv or intro_en:
+                    await speak_sv_en(intro_sv, intro_en, gesture="Nod")
+                if intro_pron:
+                    await speak_sv_en("", f"Pronunciation: {intro_pron}", gesture="Nod")
+                if intro_notes:
+                    await speak_sv_en("", f"Note: {intro_notes}", gesture="Nod")
+
+        async def speak_step(step: dict) -> None:
+            line_sv = (step.get("line_sv") or "").strip()
+            line_en = (step.get("line_en") or "").strip()
+            pronunciation = (step.get("pronunciation") or "").strip()
+            notes = (step.get("notes") or "").strip()
+            breakdown = step.get("breakdown")
+            if not isinstance(breakdown, list):
+                breakdown = []
+
+            if line_sv or line_en:
+                await speak_sv_en(line_sv, line_en, gesture="Nod")
+            if breakdown:
+                for part in breakdown:
+                    sv_word = str(part.get("sv") or "").strip()
+                    en_word = str(part.get("en") or "").strip()
+                    if sv_word and en_word:
+                        await speak_sv_en("", f"{sv_word} means {en_word}.", gesture="Nod")
+            if pronunciation:
+                await speak_sv_en("", f"Pronunciation: {pronunciation}", gesture="Nod")
+            if notes:
+                await speak_sv_en("", f"Note: {notes}", gesture="Nod")
+
+        async def sample_affect(window_s: float) -> Tuple[str, Optional[str], float]:
+            after_ts = _now() - max(0.1, window_s)
+            events = perception.snapshot_since(after_ts)
+            bucket, top_emotion = build_bucket_summary(events, min_majority=args.min_majority)
+            conf = average_confidence(events)
+            if not events:
+                latest = perception.latest()
+                if latest:
+                    bucket = latest.bucket
+                    top_emotion = latest.top_emotion
+                    conf = latest.confidence
+            return bucket, top_emotion, conf
 
         while True:
-            item = LESSON[lesson_index % len(LESSON)]
-            question_text = build_question_text(item)
-            _log(args.debug, f"[tutor] ask lesson_index={lesson_index} text={question_text!r}")
-            await furhat.speak(question_text, gesture="Nod", wait_end=args.wait_speak_end)
+            if line_index >= args.topic_max_turns:
+                break
 
-            # Only consider expressions AFTER the question was spoken.
-            after_ts = _now()
-            await asyncio.sleep(args.settle_seconds)
-            window_end = after_ts + args.observe_seconds
-            while _now() < window_end:
-                await asyncio.sleep(0.05)
-            window_events = perception.snapshot_since(after_ts)
-            bucket, top_emotion = build_bucket_summary(window_events, min_majority=args.min_majority)
-            _log(args.debug, f"[tutor] observed bucket={bucket} top_emotion={top_emotion!r} n={len(window_events)}")
+            level = levels[min(level_index, len(levels) - 1)]
+            bucket, top_emotion, conf = await sample_affect(args.affect_window_seconds)
+            bucket_history.append(bucket)
 
-            user_answer = ""
-            if args.use_asr:
-                user_answer = (
-                    await furhat.listen_text(
-                        timeout_s=args.listen_timeout,
-                        request_type=args.asr_request_type,
-                        stop_type=args.asr_stop_type,
-                        accept_any_type=not args.asr_strict_types,
-                        dump_messages=args.asr_dump,
-                        debug=args.debug,
-                    )
-                ) or ""
-                user_answer = user_answer.strip()
-                _log(args.debug, f"[tutor] ASR transcript={user_answer!r}")
-                if not user_answer:
-                    await furhat.speak("I did not catch that. Please say it again.", gesture="Thoughtful", wait_end=args.wait_speak_end)
-                    user_answer = (
-                        await furhat.listen_text(
-                            timeout_s=args.listen_timeout,
-                            request_type=args.asr_request_type,
-                            stop_type=args.asr_stop_type,
-                            accept_any_type=not args.asr_strict_types,
-                            dump_messages=args.asr_dump,
+            user_question = ""
+            doubt = False
+
+            if last_step is None:
+                await speak_sv_en(
+                    f"Skriv rad {line_index + 1}.",
+                    f"Please say line {line_index + 1}.",
+                    gesture="Nod",
+                )
+                user_line, latency_s = await listen_once("You: ")
+                latency_history.append(latency_s)
+                if not user_line:
+                    await speak_sv_en("Jag horde inget. Forsok igen.", "I did not catch that. Please try again.", gesture="Thoughtful")
+                    continue
+                if is_stop_intent(user_line):
+                    break
+                if is_topic_change(user_line):
+                    topic = extract_topic(user_line)
+                    line_index = 0
+                    repeats = 0
+                    understood_lines = 0
+                    topic_start_ts = _now()
+                    bucket_history.clear()
+                    latency_history.clear()
+                    last_step = None
+                    await speak_sv_en(f"Okej! Nytt amne: {topic}.", f"Ok! New topic: {topic}.", gesture="Nod")
+                    continue
+
+                doubt = is_doubt_text(user_line) or user_line.strip().endswith("?")
+                if doubt:
+                    user_question = user_line
+                    if args.use_openai and api_key:
+                        step = openai_generate(
+                            api_key=api_key,
+                            model=args.openai_model,
+                            system_prompt=topic_prompt,
+                            user_prompt=make_topic_user_prompt(
+                                topic=topic,
+                                level=level,
+                                bucket=bucket,
+                                user_line="",
+                                user_question=user_question,
+                                doubt=True,
+                            ),
+                            timeout_s=args.openai_timeout,
                             debug=args.debug,
                         )
-                    ) or ""
-                    user_answer = user_answer.strip()
-                    _log(args.debug, f"[tutor] ASR transcript(retry)={user_answer!r}")
-            else:
-                # Typed fallback (only if not using ASR).
-                try:
-                    user_answer = await asyncio.to_thread(input, "You: ")
-                except (EOFError, KeyboardInterrupt):
-                    break
-                user_answer = (user_answer or "").strip()
+                        if isinstance(step, dict):
+                            clarification_en = (step.get("clarification_en") or "").strip()
+                            if clarification_en:
+                                await speak_sv_en("", clarification_en, gesture="Nod")
+                    repeats += 1
+                    continue
 
-            say = None
+                last_user_line = user_line
+                step = None
+                if args.use_openai and api_key:
+                    step = openai_generate(
+                        api_key=api_key,
+                        model=args.openai_model,
+                        system_prompt=topic_prompt,
+                        user_prompt=make_topic_user_prompt(
+                            topic=topic,
+                            level=level,
+                            bucket=bucket,
+                            user_line=last_user_line,
+                            user_question="",
+                            doubt=False,
+                        ),
+                        timeout_s=args.openai_timeout,
+                        debug=args.debug,
+                    )
+
+                if not isinstance(step, dict):
+                    await speak_sv_en(
+                        "Jag kan inte oversatta just nu.",
+                        "I cannot translate right now.",
+                        gesture="Thoughtful",
+                    )
+                    repeats += 1
+                    continue
+
+                last_step = step
+
+            if not last_step:
+                await speak_sv_en("Jag hittar inget att undervisa.", "I could not build the lesson.", gesture="Thoughtful")
+                break
+
+            clarification_en = (last_step.get("clarification_en") or "").strip()
+            await speak_step(last_step)
+            if clarification_en:
+                await speak_sv_en("", clarification_en, gesture="Nod")
+
+            await speak_sv_en(
+                "Forstod du den raden? Ska jag fortsatta eller repetera?",
+                "Did you understand that line? Should I continue or repeat?",
+                gesture="Nod",
+            )
+            user_reply, latency_s = await listen_once("You: ")
+            latency_history.append(latency_s)
+
+            if not user_reply:
+                await speak_sv_en(
+                    "Jag horde inget. Vill du att jag fortsatter till nasta rad eller repetera?",
+                    "I did not catch that. Do you want me to continue to the next line or repeat?",
+                    gesture="Thoughtful",
+                )
+                decision, _ = await listen_once("You: ")
+                if is_continue_intent(decision):
+                    understood_lines += 1
+                    line_index += 1
+                    if last_step and last_user_line:
+                        batch_entries.append({"user_line": last_user_line, "step": last_step})
+                    last_step = None
+                    continue
+                if is_repeat_intent(decision) or is_not_understood_intent(decision):
+                    await speak_sv_en("Okej, vi tar den igen.", "Ok, we will repeat it.", gesture="Thoughtful")
+                    continue
+                if is_stop_intent(decision):
+                    break
+                continue
+
+            if is_topic_change(user_reply):
+                topic = extract_topic(user_reply)
+                last_step = None
+                line_index = 0
+                repeats = 0
+                understood_lines = 0
+                topic_start_ts = _now()
+                bucket_history.clear()
+                latency_history.clear()
+                await speak_sv_en(f"Okej! Nytt amne: {topic}.", f"Ok! New topic: {topic}.", gesture="Nod")
+                continue
+
+            doubt = is_doubt_text(user_reply)
+            if doubt:
+                user_question = user_reply
+                step = None
+                if args.use_openai and api_key:
+                    step = openai_generate(
+                        api_key=api_key,
+                        model=args.openai_model,
+                        system_prompt=topic_prompt,
+                        user_prompt=make_topic_user_prompt(
+                            topic=topic,
+                            level=level,
+                            bucket=bucket,
+                            user_line=last_user_line,
+                            user_question=user_question,
+                            doubt=True,
+                        ),
+                        timeout_s=args.openai_timeout,
+                        debug=args.debug,
+                    )
+                if isinstance(step, dict):
+                    clarification_en = (step.get("clarification_en") or "").strip()
+                    if clarification_en:
+                        await speak_sv_en("", clarification_en, gesture="Nod")
+                repeats += 1
+                continue
+
+            bucket, top_emotion, conf = await sample_affect(args.affect_window_seconds)
+            affect = select_affective_feedback(
+                top_emotion=top_emotion,
+                confidence=conf,
+                min_confidence=args.affect_min_confidence,
+            )
+            if affect and should_emit_affective_feedback(
+                state=affect_state,
+                feedback=affect,
+                now_ts=_now(),
+                cooldown_s=args.affect_cooldown_seconds,
+            ):
+                await speak_sv_en(affect.sv, affect.en, gesture=affect.gesture)
+                affect_state.last_key = affect.key
+                affect_state.last_ts = _now()
+
+            if is_repeat_intent(user_reply) or is_not_understood_intent(user_reply):
+                repeats += 1
+                await speak_sv_en("Okej, vi tar den igen.", "Ok, we will repeat it.", gesture="Thoughtful")
+                continue
+
+            if is_continue_intent(user_reply):
+                understood_lines += 1
+                line_index += 1
+                if last_step and last_user_line:
+                    batch_entries.append({"user_line": last_user_line, "step": last_step})
+                last_step = None
+                if len(batch_entries) > 0 and len(batch_entries) % args.review_batch_size == 0:
+                    await speak_sv_en(
+                        "Vi har gatt igenom fem rader. Vill du stoppa, repetera dem, eller fortsatta?",
+                        "We covered five lines. Do you want to stop, review them, or continue?",
+                        gesture="Nod",
+                    )
+                    decision, _ = await listen_once("You: ")
+                    if is_yes_intent(decision) or is_stop_intent(decision):
+                        break
+                    if is_review_intent(decision):
+                        for entry in batch_entries[-args.review_batch_size :]:
+                            await speak_step(entry["step"])
+                        await speak_sv_en(
+                            "Vill du fortsatta med fler rader?",
+                            "Do you want to continue with more lines?",
+                            gesture="Nod",
+                        )
+                        follow_up, _ = await listen_once("You: ")
+                        if is_yes_intent(follow_up):
+                            break
+                if understood_lines and understood_lines % args.level_up_streak == 0 and level_index < len(levels) - 1:
+                    level_index += 1
+                    await speak_sv_en("", f"Great work. Moving to level {levels[level_index]}.", gesture="BigSmile")
+                continue
+            # Any other reply: treat as a question about the line and answer it.
+            user_question = user_reply
+            step = None
             if args.use_openai and api_key:
-                out = openai_generate(
+                step = openai_generate(
                     api_key=api_key,
                     model=args.openai_model,
-                    system_prompt=system_prompt,
-                    user_prompt=make_user_prompt(
+                    system_prompt=topic_prompt,
+                    user_prompt=make_topic_user_prompt(
+                        topic=topic,
+                        level=level,
                         bucket=bucket,
-                        top_emotion=top_emotion,
-                        question_sv=str(item["sv"]),
-                        question_en=str(item["en"]),
-                        expected=str(item["answer"]),
-                        user_answer=user_answer,
+                        user_line=last_user_line,
+                        user_question=user_question,
+                        doubt=True,
                     ),
                     timeout_s=args.openai_timeout,
                     debug=args.debug,
                 )
-                if isinstance(out, dict) and isinstance(out.get("say"), str):
-                    say = out["say"].strip()
-            if not say:
-                say = default_feedback(bucket, item, user_answer)
-
-            await furhat.speak(say, gesture="Thoughtful" if bucket == "low" else "BigSmile", wait_end=args.wait_speak_end)
-
-            # Progress logic requested:
-            # - low: repeat same question next loop
-            # - medium: wait 3s then advance
-            # - high: advance immediately
-            if bucket == "high":
-                lesson_index = (lesson_index + 1) % len(LESSON)
+            if isinstance(step, dict):
+                clarification_en = (step.get("clarification_en") or "").strip()
+                if clarification_en:
+                    await speak_sv_en("", clarification_en, gesture="Nod")
+            repeats += 1
+            await speak_sv_en(
+                "Vill du att jag fortsatter till nasta rad eller repetera?",
+                "Do you want me to continue to the next line or repeat?",
+                gesture="Nod",
+            )
+            decision, _ = await listen_once("You: ")
+            if is_continue_intent(decision):
+                understood_lines += 1
+                line_index += 1
+                if last_step and last_user_line:
+                    batch_entries.append({"user_line": last_user_line, "step": last_step})
+                last_step = None
+                if len(batch_entries) > 0 and len(batch_entries) % args.review_batch_size == 0:
+                    await speak_sv_en(
+                        "Vi har gatt igenom fem rader. Vill du stoppa, repetera dem, eller fortsatta?",
+                        "We covered five lines. Do you want to stop, review them, or continue?",
+                        gesture="Nod",
+                    )
+                    decision2, _ = await listen_once("You: ")
+                    if not decision2:
+                        await speak_sv_en(
+                            "Jag horde inget. Vill du stoppa, repetera dem, eller fortsatta?",
+                            "I did not catch that. Do you want to stop, review them, or continue?",
+                            gesture="Nod",
+                        )
+                        decision2, _ = await listen_once("You: ")
+                    if is_yes_intent(decision2) or is_stop_intent(decision2):
+                        break
+                    if is_review_intent(decision2):
+                        for entry in batch_entries[-args.review_batch_size :]:
+                            line_sv = (entry["step"].get("line_sv") or "").strip()
+                            if line_sv:
+                                await speak_sv_en(line_sv, "", gesture="Nod")
+                        await speak_sv_en(
+                            "Vill du fortsatta med fler rader?",
+                            "Do you want to continue with more lines?",
+                            gesture="Nod",
+                        )
+                        follow_up, _ = await listen_once("You: ")
+                        if is_yes_intent(follow_up):
+                            break
+                    elif decision2:
+                        await speak_sv_en(
+                            "Jag fortsatter med fler rader.",
+                            "I will continue with more lines.",
+                            gesture="Nod",
+                        )
+                if understood_lines and understood_lines % args.level_up_streak == 0 and level_index < len(levels) - 1:
+                    level_index += 1
+                    await speak_sv_en("", f"Great work. Moving to level {levels[level_index]}.", gesture="BigSmile")
                 continue
-            if bucket == "medium":
-                await asyncio.sleep(args.medium_delay_seconds)
-                lesson_index = (lesson_index + 1) % len(LESSON)
+            if is_repeat_intent(decision) or is_not_understood_intent(decision):
+                await speak_sv_en("Okej, vi tar den igen.", "Ok, we will repeat it.", gesture="Thoughtful")
                 continue
-            # low: repeat same question (do not advance)
+            if is_stop_intent(decision):
+                break
             continue
+
+        duration_s = max(1.0, _now() - topic_start_ts)
+        avg_line_s = duration_s / max(1, understood_lines + max(0, line_index - understood_lines))
+        bucket_counts = Counter(bucket_history)
+        top_bucket = bucket_counts.most_common(1)[0][0] if bucket_counts else "medium"
+
+        speed_note = "steady"
+        if avg_line_s <= args.fast_line_seconds:
+            speed_note = "fast"
+        elif avg_line_s >= args.slow_line_seconds:
+            speed_note = "slow"
+
+        if top_bucket == "high":
+            affect_msg = "You seemed engaged and positive."
+        elif top_bucket == "low":
+            affect_msg = "I noticed some uncertainty. That is normal when learning."
+        else:
+            affect_msg = "You stayed calm and focused."
+
+        if speed_note == "fast":
+            speed_msg = "You moved quickly through the topic."
+        elif speed_note == "slow":
+            speed_msg = "You took your time, which is good for accuracy."
+        else:
+            speed_msg = "Your pace was steady."
+
+        repeat_msg = ""
+        if repeats:
+            repeat_msg = f"You asked for {repeats} repeats."
+
+        await speak_sv_en(
+            "Tack! Vi ar klara for idag.",
+            "Thanks! We are done for today.",
+            gesture="Nod",
+        )
+        await speak_sv_en(
+            "",
+            f"{affect_msg} {speed_msg} {repeat_msg}".strip(),
+            gesture="Nod",
+        )
 
     perception.stop()
     return 0
@@ -646,6 +1359,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--display", action="store_true", help="Show live overlay window (press q to quit window).")
     p.add_argument("--fps-limit", type=float, default=12.0, help="Max camera FPS to process (reduce CPU). 0=unlimited.")
     p.add_argument("--crop-margin", type=float, default=0.2, help="Extra margin around face crop (0..1).")
+    p.add_argument("--log-emotions", action="store_true", help="Log emotion probabilities to stderr.")
 
     p.add_argument("--openface-weights", default="weights/MTL_backbone.pth")
     p.add_argument("--openface-classifier", default="models/openface_emotion_clf.pkl")
@@ -663,8 +1377,33 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
     p.add_argument("--observe-seconds", type=float, default=2.0, help="Seconds to observe after each question.")
     p.add_argument("--settle-seconds", type=float, default=0.2, help="Delay after speaking before observing.")
-    p.add_argument("--medium-delay-seconds", type=float, default=3.0, help="Delay before advancing on medium.")
+    p.add_argument(
+        "--post-answer-observe-seconds",
+        type=float,
+        default=1.2,
+        help="Seconds to observe after the user answer.",
+    )
     p.add_argument("--min-majority", type=float, default=0.6, help="Majority needed in observation window.")
+    p.add_argument("--slow-seconds", type=float, default=4.0, help="Latency threshold (seconds) to repeat.")
+    p.add_argument("--min-confidence", type=float, default=0.5, help="Min affect confidence to advance.")
+    p.add_argument("--affect-min-confidence", type=float, default=0.55, help="Min emotion confidence for affect feedback.")
+    p.add_argument(
+        "--affect-cooldown-seconds",
+        type=float,
+        default=6.0,
+        help="Cooldown between affective feedback messages.",
+    )
+    p.add_argument(
+        "--affect-window-seconds",
+        type=float,
+        default=2.0,
+        help="Seconds of recent emotion history to summarize.",
+    )
+    p.add_argument("--fast-line-seconds", type=float, default=20.0, help="Avg seconds per line to count as fast.")
+    p.add_argument("--slow-line-seconds", type=float, default=45.0, help="Avg seconds per line to count as slow.")
+    p.add_argument("--level-up-streak", type=int, default=3, help="Correct streak to advance level in topic mode.")
+    p.add_argument("--topic-max-turns", type=int, default=10, help="Max topic practice turns before ending.")
+    p.add_argument("--review-batch-size", type=int, default=5, help="Lines per review batch.")
 
     p.add_argument("--wait-speak-end", action="store_true", help="Wait for response.speak.end between messages.")
 

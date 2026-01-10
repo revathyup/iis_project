@@ -30,6 +30,20 @@ class OpenFaceEmotionClassifier:
         self.labels = tuple(labels)
         self.features = features
 
+        # Torch >=2.6 defaults to weights_only=True; OpenFace expects full load.
+        try:
+            import torch  # type: ignore
+
+            _torch_load = torch.load
+
+            def _load_with_weights_only_false(*args, **kwargs):
+                kwargs.setdefault("weights_only", False)
+                return _torch_load(*args, **kwargs)
+
+            torch.load = _load_with_weights_only_false  # type: ignore[assignment]
+        except Exception:
+            pass
+
         from openface.multitask_model import MultitaskPredictor
 
         self._predictor = MultitaskPredictor(str(weights_path), device=device)
