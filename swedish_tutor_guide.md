@@ -86,13 +86,3 @@ If you ask a question (for example: "why do we say ut here?"), it answers the do
 - If you see no webcam window: check camera permissions and device index (`--camera 0`).
 - If it fails to connect: verify your Furhat WebSocket URI (`--uri`).
 
-## Share With Friends
-
-1) Give them the repo.
-2) Ask them to install Python 3.11.
-3) Tell them to run the steps above.
-4) They need their own OpenAI key for the tutor to work.
-
----
-
-If you want a shorter quick-start version, just ask.

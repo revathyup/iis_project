@@ -705,8 +705,12 @@ def is_doubt_text(text: str) -> bool:
         for k in (
             "how do i",
             "how to",
+            "how do you say",
+            "how do u say",
+            "how do you",
             "what does",
             "what is",
+            "what is the word for",
             "can you",
             "please explain",
             "translate",
@@ -745,20 +749,42 @@ def is_topic_change(text: str) -> bool:
     return any(k in norm for k in ("change topic", "new topic", "another topic", "switch topic"))
 
 
+def is_misheard_intent(text: str) -> bool:
+    norm = _norm(text)
+    return any(
+        k in norm
+        for k in (
+            "not my sentence",
+            "not the line",
+            "not what i said",
+            "that is not what i said",
+            "you heard wrong",
+            "misheard",
+            "wrong line",
+        )
+    )
+
+
 def make_topic_system_prompt() -> str:
     return (
         "You are a Swedish tutor. Return a JSON object with keys: "
-        "line_sv, line_en, breakdown, pronunciation, notes, clarification_en, done. "
+        "line_sv, line_en, breakdown, pronunciation, notes, clarification_sv, clarification_en, support_sv, support_en, challenge_sv, challenge_en, done. "
         "line_sv: Swedish translation of user_line (one sentence). "
         "line_en: English translation of line_sv (should match user_line meaning). "
         "breakdown: list of objects with keys sv and en (word-by-word or short phrase-by-phrase meaning). "
         "pronunciation: short English-friendly pronunciation guide for the Swedish line. "
         "notes: short usage note (optional). "
-        "clarification_en: if user_question is present or doubt=true, answer in English briefly, else empty. "
+        "clarification_sv: Swedish word/phrase that answers the user_question (if applicable). "
+        "clarification_en: English answer for the user_question (brief). "
+        "support_sv: extra simple Swedish example for low affect (optional). "
+        "support_en: English translation of support_sv (optional). "
+        "challenge_sv: slightly harder follow-up Swedish line (only when affect_bucket is high). "
+        "challenge_en: English translation of challenge_sv. "
         "done: always false for translation mode. "
         "Keep lines short, practical, and beginner-friendly unless level is advanced. "
         "Never ask the learner to repeat after you. "
-        "If affect_bucket is low, keep it simpler and slow; if high, you can be a bit faster."
+        "If affect_bucket is low, keep it simpler and include more breakdown. "
+        "If affect_bucket is high, keep it concise and add a challenge_sv/en."
     )
 
 
@@ -869,21 +895,36 @@ async def run(args: argparse.Namespace) -> int:
                 return text, 0.0
 
             start_t = _now()
-            text = (
-                await furhat.listen_text(
-                    timeout_s=args.listen_timeout,
-                    request_type=args.asr_request_type,
-                    stop_type=args.asr_stop_type,
-                    accept_any_type=not args.asr_strict_types,
-                    dump_messages=args.asr_dump,
-                    debug=args.debug,
-                )
-            ) or ""
-            end_t = _now()
-            text = text.strip()
-            if text:
-                print(f"[user][asr] {text}")
-            return text, max(0.0, end_t - start_t)
+            parts: list[str] = []
+            total_listen_s = 0.0
+            for attempt in range(max(1, args.asr_max_extends + 1)):
+                text = (
+                    await furhat.listen_text(
+                        timeout_s=args.listen_timeout if attempt == 0 else args.asr_extend_seconds,
+                        request_type=args.asr_request_type,
+                        stop_type=args.asr_stop_type,
+                        accept_any_type=not args.asr_strict_types,
+                        dump_messages=args.asr_dump,
+                        debug=args.debug,
+                    )
+                ) or ""
+                total_listen_s = max(0.0, _now() - start_t)
+                text = text.strip()
+                if text:
+                    parts.append(text)
+                    joined = " ".join(parts).strip()
+                    if args.asr_accept_early and len(joined.split()) >= args.asr_min_words:
+                        if attempt > 0:
+                            await asyncio.sleep(args.asr_pause_before_accept)
+                        print(f"[user][asr] {joined}")
+                        return joined, total_listen_s
+                if attempt < args.asr_max_extends:
+                    continue
+                break
+            joined = " ".join(parts).strip()
+            if joined:
+                print(f"[user][asr] {joined}")
+            return joined, total_listen_s
 
         await speak_sv_en(
             "Hej! Jag ar din svenska larare.",
@@ -970,11 +1011,13 @@ async def run(args: argparse.Namespace) -> int:
                 if intro_notes:
                     await speak_sv_en("", f"Note: {intro_notes}", gesture="Nod")
 
-        async def speak_step(step: dict) -> None:
+        async def speak_step(step: dict, bucket: str) -> None:
             line_sv = (step.get("line_sv") or "").strip()
             line_en = (step.get("line_en") or "").strip()
             pronunciation = (step.get("pronunciation") or "").strip()
             notes = (step.get("notes") or "").strip()
+            support_sv = (step.get("support_sv") or "").strip()
+            support_en = (step.get("support_en") or "").strip()
             breakdown = step.get("breakdown")
             if not isinstance(breakdown, list):
                 breakdown = []
@@ -991,6 +1034,8 @@ async def run(args: argparse.Namespace) -> int:
                 await speak_sv_en("", f"Pronunciation: {pronunciation}", gesture="Nod")
             if notes:
                 await speak_sv_en("", f"Note: {notes}", gesture="Nod")
+            if bucket == "low" and (support_sv or support_en):
+                await speak_sv_en(support_sv, support_en, gesture="Thoughtful")
 
         async def sample_affect(window_s: float) -> Tuple[str, Optional[str], float]:
             after_ts = _now() - max(0.1, window_s)
@@ -1027,6 +1072,13 @@ async def run(args: argparse.Namespace) -> int:
                 if not user_line:
                     await speak_sv_en("Jag horde inget. Forsok igen.", "I did not catch that. Please try again.", gesture="Thoughtful")
                     continue
+                if is_misheard_intent(user_line):
+                    await speak_sv_en(
+                        "Okej, sag raden igen.",
+                        "Ok, please say the line again.",
+                        gesture="Thoughtful",
+                    )
+                    continue
                 if is_stop_intent(user_line):
                     break
                 if is_topic_change(user_line):
@@ -1061,10 +1113,20 @@ async def run(args: argparse.Namespace) -> int:
                             debug=args.debug,
                         )
                         if isinstance(step, dict):
+                            clarification_sv = (step.get("clarification_sv") or "").strip()
                             clarification_en = (step.get("clarification_en") or "").strip()
-                            if clarification_en:
+                            if clarification_sv:
+                                await speak_sv_en(clarification_sv, clarification_en, gesture="Nod")
+                            elif clarification_en:
                                 await speak_sv_en("", clarification_en, gesture="Nod")
+                            if clarification_en:
+                                pass
                     repeats += 1
+                    await speak_sv_en(
+                        "Skriv raden igen.",
+                        "Please say the line again.",
+                        gesture="Nod",
+                    )
                     continue
 
                 last_user_line = user_line
@@ -1102,9 +1164,25 @@ async def run(args: argparse.Namespace) -> int:
                 break
 
             clarification_en = (last_step.get("clarification_en") or "").strip()
-            await speak_step(last_step)
+            await speak_step(last_step, bucket)
             if clarification_en:
                 await speak_sv_en("", clarification_en, gesture="Nod")
+
+            if bucket == "high":
+                challenge_sv = (last_step.get("challenge_sv") or "").strip()
+                challenge_en = (last_step.get("challenge_en") or "").strip()
+                if challenge_sv or challenge_en:
+                    await speak_sv_en(
+                        f"Utmaning: {challenge_sv}",
+                        f"Challenge: {challenge_en or 'Say the Swedish line.'}",
+                        gesture="BigSmile",
+                    )
+                    await speak_sv_en(
+                        f"Svara: {challenge_sv}",
+                        "Please say the challenge line.",
+                        gesture="Nod",
+                    )
+                    await listen_once("You: ")
 
             await speak_sv_en(
                 "Forstod du den raden? Ska jag fortsatta eller repetera?",
@@ -1133,6 +1211,15 @@ async def run(args: argparse.Namespace) -> int:
                     continue
                 if is_stop_intent(decision):
                     break
+                continue
+
+            if is_misheard_intent(user_reply):
+                await speak_sv_en(
+                    "Okej, sag raden igen.",
+                    "Ok, please say the line again.",
+                    gesture="Thoughtful",
+                )
+                last_step = None
                 continue
 
             if is_topic_change(user_reply):
@@ -1168,10 +1255,31 @@ async def run(args: argparse.Namespace) -> int:
                         debug=args.debug,
                     )
                 if isinstance(step, dict):
+                    clarification_sv = (step.get("clarification_sv") or "").strip()
                     clarification_en = (step.get("clarification_en") or "").strip()
-                    if clarification_en:
+                    if clarification_sv:
+                        await speak_sv_en(clarification_sv, clarification_en, gesture="Nod")
+                    elif clarification_en:
                         await speak_sv_en("", clarification_en, gesture="Nod")
                 repeats += 1
+                await speak_sv_en(
+                    "Vill du att jag fortsatter till nasta rad eller repetera?",
+                    "Do you want me to continue to the next line or repeat?",
+                    gesture="Nod",
+                )
+                decision, _ = await listen_once("You: ")
+                if is_continue_intent(decision):
+                    understood_lines += 1
+                    line_index += 1
+                    if last_step and last_user_line:
+                        batch_entries.append({"user_line": last_user_line, "step": last_step})
+                    last_step = None
+                    continue
+                if is_repeat_intent(decision) or is_not_understood_intent(decision):
+                    await speak_sv_en("Okej, vi tar den igen.", "Ok, we will repeat it.", gesture="Thoughtful")
+                    continue
+                if is_stop_intent(decision):
+                    break
                 continue
 
             bucket, top_emotion, conf = await sample_affect(args.affect_window_seconds)
@@ -1212,7 +1320,7 @@ async def run(args: argparse.Namespace) -> int:
                         break
                     if is_review_intent(decision):
                         for entry in batch_entries[-args.review_batch_size :]:
-                            await speak_step(entry["step"])
+                            await speak_step(entry["step"], "medium")
                         await speak_sv_en(
                             "Vill du fortsatta med fler rader?",
                             "Do you want to continue with more lines?",
@@ -1409,6 +1517,27 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
     p.add_argument("--use-asr", action="store_true", help="Use Furhat speech recognition instead of typed answers.")
     p.add_argument("--listen-timeout", type=float, default=8.0, help="Seconds to wait for each spoken answer.")
+    p.add_argument("--asr-min-words", type=int, default=3, help="Minimum words before accepting ASR result.")
+    p.add_argument("--asr-extend-seconds", type=float, default=6.0, help="Extra listen time to capture longer answers.")
+    p.add_argument("--asr-max-extends", type=int, default=2, help="How many extra listen cycles to attempt.")
+    p.add_argument(
+        "--asr-pause-before-accept",
+        type=float,
+        default=0.6,
+        help="Short pause before accepting extended ASR result (seconds).",
+    )
+    p.add_argument(
+        "--asr-accept-early",
+        action="store_true",
+        help="Accept ASR as soon as min words are reached (default).",
+    )
+    p.add_argument(
+        "--no-asr-accept-early",
+        dest="asr_accept_early",
+        action="store_false",
+        help="Wait full listen window (do not accept early).",
+    )
+    p.set_defaults(asr_accept_early=True)
     p.add_argument(
         "--asr-request-type",
         default="request.listen.start",
