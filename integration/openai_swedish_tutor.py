@@ -46,6 +46,16 @@ def _log(debug: bool, msg: str) -> None:
     sys.stderr.write(msg.rstrip() + "\n")
     sys.stderr.flush()
 
+# APPENDS A JSON LINE TO A FILE (IF PATH IS GIVEN)
+def _append_jsonl(path: Optional[str], payload: dict) -> None:
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    except Exception:
+        return
+
 
 def crop_face(frame, box, margin=0.2):
     x1, y1, x2, y2 = box
@@ -83,8 +93,8 @@ def pick_bucket_majority(buckets: list[str], *, min_majority: float = 0.6) -> st
         return "high"
     return tied[0]
 
-
-@dataclass(frozen=True)
+# live vision pipeline that continuously produces affect buckets
+@dataclass(frozen=True)      
 class PerceptionEvent:
     timestamp: float
     bucket: str
@@ -106,7 +116,7 @@ class AffectiveState:
     last_key: str = ""
     last_ts: float = 0.0
 
-
+# loads trained model and runs webcam -> creates engagementbucketmapper ->choose a detectore(mp)
 class PerceptionWorker:
     def __init__(
         self,
@@ -170,7 +180,7 @@ class PerceptionWorker:
             self._detector = HaarFaceDetector()
 
         self._thread = threading.Thread(target=self._run, name="PerceptionWorker", daemon=True)
-
+# RUNS THE VISION LOOP IN A BACKGROUND THREAD 
     def start(self) -> None:
         self._thread.start()
 
@@ -180,7 +190,7 @@ class PerceptionWorker:
 
     def wait_ready(self, timeout_s: float = 10.0) -> bool:
         return self._ready.wait(timeout=timeout_s)
-
+# GET ALL EVENTS SINCE A TIMESTAMP (AFTER THE QUESTION AND MOST RECENT SAMPLE)
     def snapshot_since(self, after_ts: float) -> list[PerceptionEvent]:
         with self._lock:
             return [e for e in list(self._events) if e.timestamp >= after_ts]
@@ -188,7 +198,8 @@ class PerceptionWorker:
     def latest(self) -> Optional[PerceptionEvent]:
         with self._lock:
             return self._events[-1] if self._events else None
-
+#READ THE WEBCAM FRAMES,DETCET A FACE AND CROP IT ,RUNS THE CLASSIFFIER-GETS LOGIT-MAPPER CONVERT LOGIT INTO A BUCKET- SAVES THE RESULT IN A DEQUE
+#IF --DISPLAY - DRAW THE BOINDING BOX AND BUCKET ON THE FRAME AND SHOW IT
     def _run(self) -> None:
         last_box: Optional[Tuple[int, int, int, int]] = None
         last_frame_t = 0.0
@@ -240,7 +251,7 @@ class PerceptionWorker:
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break
 
-
+# SPEECH I/O VIA WEB SOCKET TO FURHAT
 class FurhatClient:
     def __init__(self, *, uri: str, key: Optional[str], debug: bool) -> None:
         self._uri = uri
@@ -250,7 +261,7 @@ class FurhatClient:
         self._speaking = False
         self._speak_end = asyncio.Event()  # set per speak
         self._msg_q: Optional[asyncio.Queue[dict]] = None
-
+#OPENS THE WEBSCOKET AND STARTS THE RECEIVE LOOP
     async def __aenter__(self) -> "FurhatClient":
         _log(self._debug, f"[furhat] connecting to {self._uri}")
         self._ws = await websockets.connect(self._uri)
@@ -259,7 +270,7 @@ class FurhatClient:
         self._msg_q = asyncio.Queue(maxsize=500)
         self._recv_task = asyncio.create_task(self._recv_loop())
         return self
-
+#CLOSES THE WEBSOCKET CLEANLY
     async def __aexit__(self, exc_type, exc, tb) -> None:
         try:
             self._recv_task.cancel()
@@ -267,7 +278,8 @@ class FurhatClient:
             pass
         if self._ws is not None:
             await self._ws.close()
-
+#LISTENS FOR MESSAGES FROM FURHAT AND HANDLES SPEAK START/END
+#PUSHES ALL MESSAGES INTO A QUEUE FOR ASR
     async def _recv_loop(self) -> None:
         try:
             while True:
@@ -299,7 +311,7 @@ class FurhatClient:
                             pass
         except Exception:
             return
-
+#SENDS REUQEST TO FURHAT TO SPEAK TEXT WITH OPTIONAL GESTURE AND WAITS FOR END
     async def speak(self, text: str, *, gesture: Optional[str] = None, wait_end: bool = True) -> None:
         if self._ws is None:
             raise RuntimeError("Not connected")
@@ -309,7 +321,7 @@ class FurhatClient:
             await self._ws.send(json.dumps({"type": "request.gesture.start", "name": gesture}))
         if wait_end:
             await self._speak_end.wait()
-
+#starts listening and collects ASR messages until timeout or final result
     async def listen_text(
         self,
         *,
@@ -405,15 +417,16 @@ class FurhatClient:
                 transcript = text
                 break
 
-        # Stop listening (best-effort).
+        # Stop listening (best-effort). awaiting for confirmation is skipped to avoid blocking.
         try:
             await self._ws.send(json.dumps({"type": stop_type}))
         except Exception:
             pass
-
+#returns the best ASR   
         return transcript or last_text
 
-
+#OPENAI + HELPER functions(tect normalisaation ,intentdetection , topic extraction) )
+#SENDS REQUEST TO OPENAI AND PARSES THE RESPONSE JSON - makes tutor understand user input
 def openai_generate(
     *,
     api_key: Optional[str],
@@ -424,8 +437,8 @@ def openai_generate(
     debug: bool = False,
 ) -> Optional[Dict[str, str]]:
     if not api_key:
-        return None
-    url = "https://api.openai.com/v1/responses"
+        return None 
+    url = "https://api.openai.com/v1/responses"  #parses the json into python dict to be used by the tutor
     payload = {
         "model": model,
         "input": [
@@ -455,7 +468,7 @@ def openai_generate(
         if debug:
             sys.stderr.write(f"[openai] error: {e}\n")
         return None
-
+#EXTRACTS THE TEXT FIELD FROM THE OPENAI RESPONSE
     def _extract_text(resp: dict) -> Optional[str]:
         text_out = resp.get("output_text")
         if isinstance(text_out, str) and text_out.strip():
@@ -475,7 +488,7 @@ def openai_generate(
                         if part.get("type") == "text" and isinstance(part.get("text"), str):
                             return part.get("text").strip()
         return None
-
+#TRY TO PARSE JSON FROM TEXT, WITH A FALLBACK THAT EXTRACTS {...} IF NEEDED
     def _try_parse_json(text: str) -> Optional[Dict[str, str]]:
         try:
             return json.loads(text)
@@ -507,7 +520,7 @@ def openai_generate(
         sys.stderr.write(f"[openai] could not parse JSON output. raw preview: {preview}\n")
     return None
 
-
+# builds a summary bucket and top emotion from a list of perception events
 def build_bucket_summary(events: list[PerceptionEvent], *, min_majority: float) -> Tuple[str, Optional[str]]:
     if not events:
         return "medium", None
@@ -518,13 +531,13 @@ def build_bucket_summary(events: list[PerceptionEvent], *, min_majority: float) 
     top_emotion = Counter(emos).most_common(1)[0][0] if emos else None
     return bucket, top_emotion
 
-
+# computes average confidence from a list of perception events
 def average_confidence(events: list[PerceptionEvent]) -> float:
     if not events:
         return 0.0
     return sum(e.confidence for e in events) / max(1, len(events))
 
-
+# selects an affective feedback message based on top emotion and confidence
 def select_affective_feedback(
     *,
     top_emotion: Optional[str],
@@ -556,8 +569,8 @@ def select_affective_feedback(
             gesture="Nod",
         )
     return None
-
-
+# decides whether to emit affective feedback based on last feedback time/key and cooldown
+#returns true if enough time has passed or the feedback key is different
 def should_emit_affective_feedback(
     *,
     state: AffectiveState,
@@ -569,7 +582,7 @@ def should_emit_affective_feedback(
         return False
     return (now_ts - state.last_ts) >= cooldown_s or feedback.key != state.last_key
 
-
+# TEXT NORMALIZATION AND INTENT DETECTION HELPERS
 def _norm(text: str) -> str:
     text = (text or "").lower()
     keep = []
@@ -580,12 +593,12 @@ def _norm(text: str) -> str:
             keep.append(" ")
     return " ".join("".join(keep).split())
 
-
+#TOKENIZES THE EXPECTED ANSWER TEMPLATE
 def _tokens_from_expected(expected: str) -> list[str]:
     expected = expected.replace("____", " ")
     return [t for t in _norm(expected).split() if t]
 
-
+#CHECKS IF THE USER ANSWER CONTAINS ALL EXPECTED TOKENS
 def is_correct_answer(user_answer: str, expect: list[str] | None, expected_template: str) -> bool:
     if expect:
         expected_tokens = expect
@@ -596,12 +609,12 @@ def is_correct_answer(user_answer: str, expect: list[str] | None, expected_templ
     norm_answer = _norm(user_answer)
     return all(tok in norm_answer for tok in expected_tokens)
 
-
+#INTENT DETECTION FUNCTIONS
 def is_repeat_intent(text: str) -> bool:
     norm = _norm(text)
     return any(k in norm for k in ("repeat", "again", "one more", "repetera", "igen", "repeat that", "say again"))
 
-
+#CHECKS IF THE USER WANTS TO CONTINUE
 def is_continue_intent(text: str) -> bool:
     norm = _norm(text)
     return any(
@@ -621,7 +634,7 @@ def is_continue_intent(text: str) -> bool:
         )
     )
 
-
+#CHECKS IF THE USER DIDN'T UNDERSTAND
 def is_not_understood_intent(text: str) -> bool:
     norm = _norm(text)
     return any(
@@ -629,22 +642,22 @@ def is_not_understood_intent(text: str) -> bool:
         for k in ("no", "not", "didnt understand", "dont understand", "not sure", "i dont get", "forstar inte")
     )
 
-
+#CHECKS IF THE USER ANSWERED YES
 def is_yes_intent(text: str) -> bool:
     norm = _norm(text)
     return any(k in norm for k in ("yes", "yeah", "yep", "sure", "correct", "right", "ja"))
 
-
+#CHECKS IF THE USER ANSWERED NO
 def is_no_intent(text: str) -> bool:
     norm = _norm(text)
     return any(k in norm for k in ("no", "nope", "nah", "not", "incorrect", "wrong", "nej"))
 
-
+#CHECKS IF THE USER WANTS TO STOP THE SESSION
 def is_stop_intent(text: str) -> bool:
     norm = _norm(text)
     return any(k in norm for k in ("stop", "finish", "done", "enough", "sluta", "stopp", "avsluta"))
 
-
+#CHECKS IF THE USER WANTS TO REVIEW PREVIOUS LINES
 def is_review_intent(text: str) -> bool:
     norm = _norm(text)
     return any(
@@ -664,7 +677,7 @@ def is_review_intent(text: str) -> bool:
         )
     )
 
-
+#   PARSES THE NUMBER OF LINES THE USER WANTS TO REVIEW
 def parse_line_count(text: str, default: int) -> int:
     norm = _norm(text)
     for token in norm.split():
@@ -692,12 +705,12 @@ def parse_line_count(text: str, default: int) -> int:
             return val
     return default
 
-
+#CHECKS IF THE USER WANTS TO ADVANCE TO THE NEXT TOPIC/LINE
 def is_advance_intent(text: str) -> bool:
     norm = _norm(text)
     return any(k in norm for k in ("move on", "next", "forward", "advance", "ga vidare", "nasta"))
 
-
+#CHECKS IF THE USER HAS A DOUBT/QUESTION
 def is_doubt_text(text: str) -> bool:
     norm = _norm(text)
     return any(
@@ -719,7 +732,7 @@ def is_doubt_text(text: str) -> bool:
         )
     )
 
-
+#EXTRACTS THE TOPIC THE USER WANTS TO TALK ABOUT
 def extract_topic(text: str) -> str:
     norm = _norm(text)
     # Drop common greetings/fillers at the start.
@@ -742,13 +755,13 @@ def extract_topic(text: str) -> str:
     # Common ASR confusion: whether -> weather.
     norm = norm.replace("whether", "weather")
     return norm.strip() or "something"
-
+#CHECKS IF THE USER WANTS TO CHANGE TOPIC
 
 def is_topic_change(text: str) -> bool:
     norm = _norm(text)
     return any(k in norm for k in ("change topic", "new topic", "another topic", "switch topic"))
 
-
+#CHECKS IF THE USER THINKS THE TUTOR MISHEARD THEM
 def is_misheard_intent(text: str) -> bool:
     norm = _norm(text)
     return any(
@@ -764,6 +777,7 @@ def is_misheard_intent(text: str) -> bool:
         )
     )
 
+#Defines JSON schema OpenAI must return (sv line, en translation, breakdown, etc.).
 
 def make_topic_system_prompt() -> str:
     return (
@@ -787,7 +801,7 @@ def make_topic_system_prompt() -> str:
         "If affect_bucket is high, keep it concise and add a challenge_sv/en."
     )
 
-
+#Injects topic + user line + affect bucket into the OpenAI call.
 def make_topic_user_prompt(
     *,
     topic: str,
@@ -807,7 +821,7 @@ def make_topic_user_prompt(
         "Return JSON only."
     )
 
-
+# TOPIC INTRO PROMPT BUILDERS FOR OPENAI
 def make_topic_intro_system_prompt() -> str:
     return (
         "You are a Swedish tutor. Return a JSON object with keys: sv, en, pronunciation, notes. "
@@ -818,11 +832,12 @@ def make_topic_intro_system_prompt() -> str:
         "Keep it brief."
     )
 
-
+# TOPIC INTRO USER PROMPT BUILDER  
 def make_topic_intro_user_prompt(*, topic: str) -> str:
     return f"topic={topic}\nReturn JSON only."
 
-
+# DECIDES WHETHER TO ADVANCE OR REPEAT BASED ON AFFECT AND CONFIDENCE
+#
 def decide_strategy(
     *,
     correct: bool,
@@ -842,7 +857,7 @@ def decide_strategy(
         return "repeat"
     return "advance"
 
-
+# MAIN ASYNC RUN FUNCTION.
 async def run(args: argparse.Namespace) -> int:
     import asyncio
 
@@ -873,7 +888,7 @@ async def run(args: argparse.Namespace) -> int:
     perception.start()
     if not perception.wait_ready(timeout_s=10.0):
         raise RuntimeError("Perception did not start (webcam).")
-
+# CONNECT TO FURHAT VIA WEBSOCKET
     async with FurhatClient(uri=args.uri, key=args.key, debug=args.debug) as furhat:
         async def speak_sv_en(sv: str, en: str, *, gesture: Optional[str] = None) -> None:
             if sv:
@@ -925,7 +940,11 @@ async def run(args: argparse.Namespace) -> int:
             if joined:
                 print(f"[user][asr] {joined}")
             return joined, total_listen_s
-
+# LOGGING FUNCTION
+        def log_turn(payload: dict) -> None:
+            payload["ts"] = _now()
+            _append_jsonl(args.session_log, payload)
+# MAIN TUTORING LOOP
         await speak_sv_en(
             "Hej! Jag ar din svenska larare.",
             "Hi! I am your Swedish tutor.",
@@ -1010,7 +1029,7 @@ async def run(args: argparse.Namespace) -> int:
                     await speak_sv_en("", f"Pronunciation: {intro_pron}", gesture="Nod")
                 if intro_notes:
                     await speak_sv_en("", f"Note: {intro_notes}", gesture="Nod")
-
+# FUNCTION TO SPEAK A TUTORING STEP
         async def speak_step(step: dict, bucket: str) -> None:
             line_sv = (step.get("line_sv") or "").strip()
             line_en = (step.get("line_en") or "").strip()
@@ -1036,7 +1055,7 @@ async def run(args: argparse.Namespace) -> int:
                 await speak_sv_en("", f"Note: {notes}", gesture="Nod")
             if bucket == "low" and (support_sv or support_en):
                 await speak_sv_en(support_sv, support_en, gesture="Thoughtful")
-
+# SAMPLES AFFECTIVE STATE FROM PERCEPTION WORKER
         async def sample_affect(window_s: float) -> Tuple[str, Optional[str], float]:
             after_ts = _now() - max(0.1, window_s)
             events = perception.snapshot_since(after_ts)
@@ -1070,7 +1089,11 @@ async def run(args: argparse.Namespace) -> int:
                 user_line, latency_s = await listen_once("You: ")
                 latency_history.append(latency_s)
                 if not user_line:
-                    await speak_sv_en("Jag horde inget. Forsok igen.", "I did not catch that. Please try again.", gesture="Thoughtful")
+                    await speak_sv_en(
+                        "Jag horde inget. Forsok igen.",
+                        "I did not catch that. Please try again.",
+                        gesture="Thoughtful",
+                    )
                     continue
                 if is_misheard_intent(user_line):
                     await speak_sv_en(
@@ -1119,9 +1142,20 @@ async def run(args: argparse.Namespace) -> int:
                                 await speak_sv_en(clarification_sv, clarification_en, gesture="Nod")
                             elif clarification_en:
                                 await speak_sv_en("", clarification_en, gesture="Nod")
-                            if clarification_en:
-                                pass
                     repeats += 1
+                    log_turn(
+                        {
+                            "phase": "topic",
+                            "event": "doubt",
+                            "topic": topic,
+                            "level": levels[min(level_index, len(levels) - 1)],
+                            "user_question": user_question,
+                            "bucket": bucket,
+                            "emotion": top_emotion,
+                            "confidence": conf,
+                            "latency_s": latency_s,
+                        }
+                    )
                     await speak_sv_en(
                         "Skriv raden igen.",
                         "Please say the line again.",
@@ -1153,6 +1187,15 @@ async def run(args: argparse.Namespace) -> int:
                         "Jag kan inte oversatta just nu.",
                         "I cannot translate right now.",
                         gesture="Thoughtful",
+                    )
+                    log_turn(
+                    {
+                        "phase": "topic",
+                        "event": "openai_error",
+                        "topic": topic,
+                        "level": levels[min(level_index, len(levels) - 1)],
+                        "user_line": last_user_line,
+                    }
                     )
                     repeats += 1
                     continue
@@ -1301,6 +1344,20 @@ async def run(args: argparse.Namespace) -> int:
             if is_repeat_intent(user_reply) or is_not_understood_intent(user_reply):
                 repeats += 1
                 await speak_sv_en("Okej, vi tar den igen.", "Ok, we will repeat it.", gesture="Thoughtful")
+                log_turn(
+                    {
+                        "phase": "topic",
+                        "event": "repeat",
+                        "topic": topic,
+                        "level": levels[min(level_index, len(levels) - 1)],
+                        "bucket": bucket,
+                        "emotion": top_emotion,
+                        "confidence": conf,
+                        "latency_s": latency_s,
+                        "line_sv": (last_step or {}).get("line_sv"),
+                        "line_en": (last_step or {}).get("line_en"),
+                    }
+                )
                 continue
 
             if is_continue_intent(user_reply):
@@ -1308,6 +1365,20 @@ async def run(args: argparse.Namespace) -> int:
                 line_index += 1
                 if last_step and last_user_line:
                     batch_entries.append({"user_line": last_user_line, "step": last_step})
+                log_turn(
+                    {
+                        "phase": "topic",
+                        "event": "advance",
+                        "topic": topic,
+                        "level": levels[min(level_index, len(levels) - 1)],
+                        "bucket": bucket,
+                        "emotion": top_emotion,
+                        "confidence": conf,
+                        "latency_s": latency_s,
+                        "line_sv": (last_step or {}).get("line_sv"),
+                        "line_en": (last_step or {}).get("line_en"),
+                    }
+                )
                 last_step = None
                 if len(batch_entries) > 0 and len(batch_entries) % args.review_batch_size == 0:
                     await speak_sv_en(
@@ -1414,7 +1485,7 @@ async def run(args: argparse.Namespace) -> int:
             if is_stop_intent(decision):
                 break
             continue
-
+# END OF MAIN TUTORING LOOP - SUMMARY FEEDBACK
         duration_s = max(1.0, _now() - topic_start_ts)
         avg_line_s = duration_s / max(1, understood_lines + max(0, line_index - understood_lines))
         bucket_counts = Counter(bucket_history)
@@ -1458,7 +1529,7 @@ async def run(args: argparse.Namespace) -> int:
     perception.stop()
     return 0
 
-
+# ARGPARSE SETUP FUNCTION 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Interactive Swedish tutor (Furhat Realtime + OpenFace + OpenAI).")
     p.add_argument("--uri", required=True, help="Realtime API WS URI (e.g. ws://localhost:9000/v1/events).")
@@ -1558,6 +1629,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--use-openai", action="store_true", help="Enable OpenAI feedback (requires OPENAI_API_KEY).")
     p.add_argument("--openai-model", default="gpt-4o-mini", help="OpenAI model name.")
     p.add_argument("--openai-timeout", type=float, default=30.0)
+    p.add_argument("--session-log", default=None, help="Write session events as JSONL.")
 
     p.add_argument("--debug", action="store_true")
     return p.parse_args(argv)
